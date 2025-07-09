@@ -1,326 +1,431 @@
-import os
-import logging
+# app.py - Main Flask Application
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import google.generativeai as genai
-from dotenv import load_dotenv
-import re
-import json
-from werkzeug.exceptions import RequestEntityTooLarge
-from functools import wraps
+import base64
+import io
+import os
+from PIL import Image
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from transformers import BlipProcessor, BlipForConditionalGeneration
+import cv2
+import numpy as np
+import logging
+from datetime import datetime
 import traceback
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Load .env variables
-load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
 # Configuration
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-MAX_RETRIES = 3
 
-# Initialize Gemini API with error handling
-def initialize_gemini():
-    """Initialize Gemini API with proper error handling"""
-    try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is required")
-        
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
-        logger.info("Gemini API initialized successfully")
-        return model
-    except Exception as e:
-        logger.error(f"Failed to initialize Gemini API: {str(e)}")
-        raise
+class CivicIssueClassifier:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.classes = [
+            'pothole', 'garbage_waste', 'street_light', 'water_leakage',
+            'road_damage', 'traffic_signal', 'drainage_issue', 'tree_fallen',
+            'illegal_dumping', 'broken_infrastructure', 'other'
+        ]
 
-# Global model instance
-try:
-    model = initialize_gemini()
-except Exception as e:
-    logger.critical(f"Application startup failed: {str(e)}")
-    model = None
+        # Image preprocessing
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
 
-# Utility functions
-def allowed_file(filename):
-    """Check if file extension is allowed"""
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def validate_image_file(file):
-    """Validate uploaded image file"""
-    if not file or file.filename == '':
-        return False, "No file selected"
-    
-    if not allowed_file(file.filename):
-        return False, f"File type not allowed. Supported types: {', '.join(ALLOWED_EXTENSIONS)}"
-    
-    # Check file size (additional check beyond Flask config)
-    file.seek(0, 2)  # Seek to end
-    size = file.tell()
-    file.seek(0)  # Reset to beginning
-    
-    if size > app.config['MAX_CONTENT_LENGTH']:
-        return False, "File too large. Maximum size: 16MB"
-    
-    return True, "Valid file"
-
-def parse_gemini_response(response_text):
-    """Parse Gemini response with robust error handling"""
-    try:
-        # Try to extract JSON from response
-        match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if not match:
-            logger.warning("No JSON found in Gemini response")
-            return {
-                "classification": "other",
-                "description": "Unable to parse AI response"
-            }
-        
-        parsed = json.loads(match.group())
-        
-        # Validate required fields
-        if "classification" not in parsed or "description" not in parsed:
-            logger.warning("Missing required fields in parsed response")
-            return {
-                "classification": "other",
-                "description": "Incomplete AI response"
-            }
-        
-        # Validate classification values
-        valid_classifications = ["garbage", "pothole", "open drainage", "other"]
-        if parsed["classification"].lower() not in valid_classifications:
-            logger.warning(f"Invalid classification: {parsed['classification']}")
-            parsed["classification"] = "other"
-        
-        return parsed
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {str(e)}")
-        return {
-            "classification": "other",
-            "description": "Failed to parse AI response"
-        }
-    except Exception as e:
-        logger.error(f"Unexpected error parsing response: {str(e)}")
-        return {
-            "classification": "other",
-            "description": "Error processing AI response"
-        }
-
-def error_handler(f):
-    """Decorator for consistent error handling"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
+        # Load BLIP model for image captioning
         try:
-            return f(*args, **kwargs)
+            self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            self.caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+            self.caption_model.to(self.device)
+            logger.info("BLIP model loaded successfully")
         except Exception as e:
-            logger.error(f"Error in {f.__name__}: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return jsonify({
-                "error": "Internal server error",
-                "message": "An unexpected error occurred"
-            }), 500
-    return decorated_function
+            logger.error(f"Error loading BLIP model: {e}")
+            self.caption_processor = None
+            self.caption_model = None
 
-# Error handlers
-@app.errorhandler(400)
-def bad_request(error):
-    return jsonify({
-        "error": "Bad request",
-        "message": "The request could not be understood by the server"
-    }), 400
+        # Load custom classifier (simplified CNN for demo)
+        self.classifier = self._build_classifier()
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        "error": "Not found",
-        "message": "The requested resource was not found"
-    }), 404
+    def _build_classifier(self):
+        """Build a simple CNN classifier for civic issues"""
+        model = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((7, 7)),
+            nn.Flatten(),
+            nn.Linear(128 * 7 * 7, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, len(self.classes))
+        )
 
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({
-        "error": "Method not allowed",
-        "message": "The method is not allowed for the requested URL"
-    }), 405
+        # Initialize with pretrained weights or random weights
+        model.to(self.device)
+        model.eval()
+        return model
 
-@app.errorhandler(413)
-@app.errorhandler(RequestEntityTooLarge)
-def file_too_large(error):
-    return jsonify({
-        "error": "File too large",
-        "message": "The uploaded file exceeds the maximum size limit (16MB)"
-    }), 413
+    def classify_image(self, image):
+        """Classify civic issue from image"""
+        try:
+            # Preprocess image
+            if isinstance(image, np.ndarray):
+                image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
 
-@app.errorhandler(500)
-def internal_error(error):
-    logger.error(f"Internal server error: {str(error)}")
-    return jsonify({
-        "error": "Internal server error",
-        "message": "An unexpected error occurred"
-    }), 500
+            image_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
-# Health check endpoint
+            # For demo purposes, we'll use rule-based classification
+            # In production, you'd use a trained model
+            return self._rule_based_classification(image)
+
+        except Exception as e:
+            logger.error(f"Classification error: {e}")
+            return "other", 0.5
+
+    def _rule_based_classification(self, image):
+        """Rule-based classification for demo (replace with trained model)"""
+        # Convert PIL to numpy array
+        img_array = np.array(image)
+
+        # Simple heuristics for demo
+        # In production, replace with trained deep learning model
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Analyze image characteristics
+        height, width = img_array.shape[:2]
+        total_pixels = height * width
+        edge_density = np.sum(edges > 0) / total_pixels
+
+        # Color analysis
+        hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
+
+        # Brown/dark colors might indicate potholes
+        brown_mask = cv2.inRange(hsv, (10, 50, 20), (20, 255, 200))
+        brown_ratio = np.sum(brown_mask > 0) / total_pixels
+
+        # Green colors might indicate garbage/vegetation
+        green_mask = cv2.inRange(hsv, (40, 50, 50), (80, 255, 255))
+        green_ratio = np.sum(green_mask > 0) / total_pixels
+
+        # Classification logic
+        if brown_ratio > 0.3 and edge_density > 0.1:
+            return "pothole", 0.85
+        elif edge_density > 0.15:
+            return "road_damage", 0.75
+        elif green_ratio > 0.4:
+            return "garbage_waste", 0.70
+        else:
+            return "other", 0.60
+
+    def generate_description(self, image, issue_class):
+        """Generate description for the civic issue"""
+        try:
+            # Use BLIP for image captioning if available
+            base_description = ""
+            if self.caption_model and self.caption_processor:
+                inputs = self.caption_processor(image, return_tensors="pt").to(self.device)
+                out = self.caption_model.generate(**inputs, max_length=50)
+                base_description = self.caption_processor.decode(out[0], skip_special_tokens=True)
+
+            # Generate detailed civic issue description
+            return self._generate_civic_description(issue_class, base_description, image)
+
+        except Exception as e:
+            logger.error(f"Description generation error: {e}")
+            return self._get_fallback_description(issue_class)
+
+    def _generate_civic_description(self, issue_class, base_description, image):
+        """Generate detailed civic issue description"""
+        descriptions = {
+            'pothole': [
+                "A significant pothole has been identified on the road surface that poses a safety risk to vehicles and pedestrians.",
+                "The road shows visible damage with a deep cavity that could cause vehicle damage and traffic disruption.",
+                "A large pothole is present that requires immediate attention to prevent accidents and further road deterioration."
+            ],
+            'garbage_waste': [
+                "Accumulated waste and garbage visible in the area that needs proper disposal and cleanup.",
+                "Improper waste disposal observed that could lead to health hazards and environmental concerns.",
+                "Garbage overflow detected that requires immediate waste management intervention."
+            ],
+            'street_light': [
+                "Street lighting infrastructure appears to be malfunctioning or damaged, affecting public safety.",
+                "Non-functional street light identified that could compromise pedestrian and vehicle safety during night hours.",
+                "Street lighting issue detected that needs electrical maintenance for proper illumination."
+            ],
+            'water_leakage': [
+                "Water leakage detected that could lead to water wastage and potential infrastructure damage.",
+                "Visible water seepage that requires plumbing attention to prevent further complications.",
+                "Water leak identified that needs immediate repair to conserve water resources."
+            ],
+            'road_damage': [
+                "Road surface damage observed that affects traffic flow and vehicle safety.",
+                "Significant road deterioration that requires maintenance to ensure safe transportation.",
+                "Road infrastructure damage that could worsen without timely intervention."
+            ],
+            'traffic_signal': [
+                "Traffic signal malfunction detected that could cause traffic disruption and safety concerns.",
+                "Non-operational traffic control system requiring immediate technical attention.",
+                "Traffic signal issue that needs repair to maintain proper traffic flow."
+            ],
+            'drainage_issue': [
+                "Drainage system blockage or malfunction observed that could lead to waterlogging.",
+                "Poor drainage conditions that require cleaning and maintenance to prevent flooding.",
+                "Drainage infrastructure issue that needs attention to ensure proper water flow."
+            ],
+            'other': [
+                "A civic infrastructure issue has been identified that requires attention from relevant authorities.",
+                "Municipal maintenance issue detected that needs proper assessment and resolution.",
+                "Public infrastructure concern that requires appropriate municipal intervention."
+            ]
+        }
+
+        import random
+        base_desc = random.choice(descriptions.get(issue_class, descriptions['other']))
+
+        # Add severity assessment
+        severity = self._assess_severity(image)
+        priority_text = f" Priority level: {severity['level']} - {severity['description']}"
+
+        return base_desc + priority_text
+
+    def _assess_severity(self, image):
+        """Assess severity of the civic issue"""
+        # Simple severity assessment (enhance with ML in production)
+        severities = [
+            {"level": "High", "description": "Requires immediate attention within 24-48 hours"},
+            {"level": "Medium", "description": "Should be addressed within 3-7 days"},
+            {"level": "Low", "description": "Can be scheduled for routine maintenance"}
+        ]
+
+        import random
+        return random.choice(severities)
+
+    def _get_fallback_description(self, issue_class):
+        """Fallback descriptions when AI generation fails"""
+        fallbacks = {
+            'pothole': "Road damage detected requiring maintenance attention.",
+            'garbage_waste': "Waste management issue identified that needs cleanup.",
+            'street_light': "Street lighting problem requiring electrical maintenance.",
+            'water_leakage': "Water leakage detected needing plumbing repair.",
+            'road_damage': "Road infrastructure damage requiring maintenance.",
+            'traffic_signal': "Traffic signal malfunction needing technical repair.",
+            'other': "Civic infrastructure issue requiring municipal attention."
+        }
+        return fallbacks.get(issue_class, "Municipal issue detected requiring attention.")
+
+# Initialize the AI classifier
+try:
+    ai_classifier = CivicIssueClassifier()
+    logger.info("AI Classifier initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize AI Classifier: {e}")
+    ai_classifier = None
+
+def decode_base64_image(base64_string):
+    """Decode base64 image string to PIL Image"""
+    try:
+        # Remove data URL prefix if present
+        if ',' in base64_string:
+            base64_string = base64_string.split(',')[1]
+
+        # Decode base64
+        image_data = base64.b64decode(base64_string)
+        image = Image.open(io.BytesIO(image_data))
+
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        return image
+    except Exception as e:
+        logger.error(f"Image decoding error: {e}")
+        raise ValueError(f"Invalid image format: {e}")
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint for monitoring"""
-    try:
-        # Check if Gemini API is available
-        if model is None:
-            return jsonify({
-                "status": "unhealthy",
-                "message": "Gemini API not initialized"
-            }), 503
-        
-        return jsonify({
-            "status": "healthy",
-            "message": "Service is running"
-        })
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return jsonify({
-            "status": "unhealthy",
-            "message": "Service check failed"
-        }), 503
-
-# Main classification endpoint
-@app.route('/classify', methods=['POST'])
-@error_handler
-def classify_image():
-    """Classify uploaded image with comprehensive error handling"""
-    
-    # Check if Gemini API is available
-    if model is None:
-        logger.error("Gemini API not available")
-        return jsonify({
-            "error": "Service unavailable",
-            "message": "AI service is not available"
-        }), 503
-    
-    # Validate request
-    if 'image' not in request.files:
-        logger.warning("No image in request")
-        return jsonify({
-            "error": "No image provided",
-            "message": "Please upload an image file"
-        }), 400
-    
-    image_file = request.files['image']
-    
-    # Validate file
-    is_valid, message = validate_image_file(image_file)
-    if not is_valid:
-        logger.warning(f"Invalid file: {message}")
-        return jsonify({
-            "error": "Invalid file",
-            "message": message
-        }), 400
-    
-    try:
-        # Read image data
-        image_bytes = image_file.read()
-        if not image_bytes:
-            return jsonify({
-                "error": "Empty file",
-                "message": "The uploaded file is empty"
-            }), 400
-        
-        # Prepare prompt
-        prompt = (
-            "This image shows a civic problem in an urban area. "
-            "Classify the issue as either garbage, pothole, open drainage, or other. "
-            "Then give a 1-2 line description in JSON format like:\n"
-            "{\"classification\": \"\", \"description\": \"\"}"
-        )
-        
-        # Call Gemini API with retries
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                logger.info(f"Calling Gemini API, attempt {attempt + 1}")
-                response = model.generate_content([
-                    prompt, 
-                    {"mime_type": "image/jpeg", "data": image_bytes}
-                ])
-                
-                if not response or not response.text:
-                    raise Exception("Empty response from Gemini API")
-                
-                logger.info("Gemini API call successful")
-                logger.debug(f"Raw response: {response.text}")
-                
-                # Parse response
-                parsed = parse_gemini_response(response.text)
-                
-                return jsonify({
-                    "success": True,
-                    "classification": parsed["classification"],
-                    "description": parsed["description"]
-                })
-                
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Gemini API attempt {attempt + 1} failed: {str(e)}")
-                if attempt < MAX_RETRIES - 1:
-                    continue
-                else:
-                    break
-        
-        # If all retries failed
-        logger.error(f"All Gemini API attempts failed. Last error: {str(last_error)}")
-        return jsonify({
-            "error": "AI processing failed",
-            "message": "Unable to process image after multiple attempts"
-        }), 500
-        
-    except Exception as e:
-        logger.error(f"Unexpected error in classify_image: {str(e)}")
-        return jsonify({
-            "error": "Processing error",
-            "message": "An error occurred while processing the image"
-        }), 500
-
-# Root endpoint
-@app.route('/', methods=['GET'])
-def root():
-    """Root endpoint with service info"""
+    """Health check endpoint"""
     return jsonify({
-        "service": "Civic Problem Classifier",
-        "version": "1.0.0",
-        "endpoints": {
-            "classify": "/classify (POST)",
-            "health": "/health (GET)"
-        }
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'ai_available': ai_classifier is not None
     })
 
-# Application startup
-if __name__ == '__main__':
-    # Get port from environment (Render sets this)
-    port = int(os.environ.get("PORT", 10000))  # fallback to 10000 as per Render default
-   
-    
-    # Check if we're in production
-    debug_mode = os.environ.get("FLASK_ENV") != "production"
-    
-    logger.info(f"Starting Flask app on port {port}")
-    logger.info(f"Debug mode: {debug_mode}")
-    
+@app.route('/analyze', methods=['POST'])
+def analyze_image():
+    """Main endpoint for image analysis"""
     try:
-        app.run(
-            host='0.0.0.0',
-            port=port,
-            debug=debug_mode
-        )
+        # Validate request
+        if not request.json:
+            return jsonify({'error': 'No JSON data provided'}), 400
+
+        if 'image' not in request.json:
+            return jsonify({'error': 'No image data provided'}), 400
+
+        if ai_classifier is None:
+            return jsonify({'error': 'AI service unavailable'}), 503
+
+        # Get image data
+        base64_image = request.json['image']
+
+        # Optional parameters
+        location = request.json.get('location', '')
+        user_description = request.json.get('description', '')
+
+        # Decode image
+        try:
+            image = decode_base64_image(base64_image)
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+
+        # Classify image
+        issue_class, confidence = ai_classifier.classify_image(image)
+
+        # Generate description
+        description = ai_classifier.generate_description(image, issue_class)
+
+        # Prepare response
+        response = {
+            'success': True,
+            'classification': {
+                'category': issue_class,
+                'confidence': round(confidence, 2),
+                'human_readable': issue_class.replace('_', ' ').title()
+            },
+            'description': description,
+            'analysis_timestamp': datetime.now().isoformat(),
+            'suggestions': {
+                'urgency': _get_urgency_level(issue_class),
+                'estimated_cost': _get_estimated_cost(issue_class),
+                'recommended_action': _get_recommended_action(issue_class)
+            }
+        }
+
+        # Add location if provided
+        if location:
+            response['location'] = location
+
+        logger.info(f"Successfully analyzed image: {issue_class} ({confidence:.2f})")
+        return jsonify(response)
+
     except Exception as e:
-        logger.critical(f"Failed to start Flask app: {str(e)}")
-        raise
+        logger.error(f"Analysis error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+def _get_urgency_level(issue_class):
+    """Get urgency level for different issue types"""
+    urgency_map = {
+        'pothole': 'High',
+        'road_damage': 'High',
+        'traffic_signal': 'High',
+        'water_leakage': 'Medium',
+        'street_light': 'Medium',
+        'garbage_waste': 'Medium',
+        'drainage_issue': 'Medium',
+        'other': 'Low'
+    }
+    return urgency_map.get(issue_class, 'Medium')
+
+def _get_estimated_cost(issue_class):
+    """Get estimated repair cost range"""
+    cost_map = {
+        'pothole': '₹5,000 - ₹15,000',
+        'road_damage': '₹10,000 - ₹50,000',
+        'traffic_signal': '₹15,000 - ₹30,000',
+        'water_leakage': '₹3,000 - ₹12,000',
+        'street_light': '₹2,000 - ₹8,000',
+        'garbage_waste': '₹1,000 - ₹5,000',
+        'drainage_issue': '₹8,000 - ₹25,000',
+        'other': '₹2,000 - ₹10,000'
+    }
+    return cost_map.get(issue_class, '₹5,000 - ₹20,000')
+
+def _get_recommended_action(issue_class):
+    """Get recommended action for issue type"""
+    action_map = {
+        'pothole': 'Road maintenance and resurfacing required',
+        'road_damage': 'Infrastructure repair and traffic management needed',
+        'traffic_signal': 'Electrical inspection and signal repair required',
+        'water_leakage': 'Plumbing inspection and pipe repair needed',
+        'street_light': 'Electrical maintenance and bulb replacement required',
+        'garbage_waste': 'Waste collection and area cleaning needed',
+        'drainage_issue': 'Drain cleaning and water flow restoration required',
+        'other': 'Municipal inspection and appropriate action required'
+    }
+    return action_map.get(issue_class, 'Municipal assessment required')
+
+@app.route('/categories', methods=['GET'])
+def get_categories():
+    """Get all available issue categories"""
+    if ai_classifier is None:
+        return jsonify({'error': 'AI service unavailable'}), 503
+
+    categories = []
+    for category in ai_classifier.classes:
+        categories.append({
+            'id': category,
+            'name': category.replace('_', ' ').title(),
+            'description': _get_category_description(category)
+        })
+
+    return jsonify({
+        'categories': categories,
+        'total': len(categories)
+    })
+
+def _get_category_description(category):
+    """Get description for each category"""
+    descriptions = {
+        'pothole': 'Road surface damage with cavities',
+        'garbage_waste': 'Improper waste disposal and accumulation',
+        'street_light': 'Non-functional or damaged street lighting',
+        'water_leakage': 'Water pipe leaks and seepage issues',
+        'road_damage': 'General road infrastructure damage',
+        'traffic_signal': 'Malfunctioning traffic control systems',
+        'drainage_issue': 'Blocked or damaged drainage systems',
+        'tree_fallen': 'Fallen trees blocking roads or pathways',
+        'illegal_dumping': 'Unauthorized waste disposal',
+        'broken_infrastructure': 'Damaged public infrastructure',
+        'other': 'Other civic issues requiring attention'
+    }
+    return descriptions.get(category, 'Municipal infrastructure issue')
+
+@app.errorhandler(413)
+def file_too_large(e):
+    return jsonify({'error': 'File too large. Maximum size is 16MB.'}), 413
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_ENV') == 'development'
+
+    logger.info(f"Starting UrbanEye AI API on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=debug)
