@@ -3,7 +3,7 @@ services:
     name: flask-ai-app
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app -b 0.0.0.0:$PORT
     envVars:
-      - key: AIzaSyDxoMr0PeLxv9DdO4dzxKdinXjphAJ7WVo
-        sync: false  # We'll set this manually in the Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false  # Set this manually in the Render dashboard
