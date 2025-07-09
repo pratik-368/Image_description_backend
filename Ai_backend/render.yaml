@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: flask-ai-app
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: AIzaSyDxoMr0PeLxv9DdO4dzxKdinXjphAJ7WVo
+        sync: false  # We'll set this manually in the Render dashboard
