@@ -3,14 +3,16 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
 from dotenv import load_dotenv
+import re
+import json
 
-# Load .env file
+# Load .env variables
 load_dotenv()
 
-# Configure Gemini
-genai.configure(api_key="GEMINI_API_KEY")
+# Configure Gemini API using environment variable
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Use the correct model from your list
+# Use the Gemini model
 model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 app = Flask(__name__)
@@ -38,8 +40,6 @@ def classify_image():
 
         print("Gemini raw response:\n", response.text)
 
-        # Extract JSON from response
-        import re, json
         match = re.search(r'\{.*\}', response.text, re.DOTALL)
         parsed = json.loads(match.group()) if match else {
             "classification": "Unknown",
@@ -52,5 +52,7 @@ def classify_image():
         print("Gemini API Error:", str(e))
         return jsonify({"error": "AI processing failed"}), 500
 
+# 🚀 Critical for Render — bind to 0.0.0.0 and use PORT from environment
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))  # Render sets this PORT
+    app.run(host='0.0.0.0', port=port)
