@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configure Gemini
-genai.configure(api_key="AIzaSyDxoMr0PeLxv9DdO4dzxKdinXjphAJ7WVo")
+genai.configure(api_key="GEMINI_API_KEY")
 
 # Use the correct model from your list
 model = genai.GenerativeModel("models/gemini-2.5-flash")
